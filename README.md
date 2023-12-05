@@ -1,1 +1,1 @@
-# attention-fusion
+A simple yet effective attention mechanism that combines various self-attention variants with the Vision Transformer (ViT) architecture for enhanced skin lesion classification. Leveraging Scaled Dot-Product Attention, Multiplicative Attention, and Additive Attention, a unified framework that captures diverse contextual information within dermatological images is created. The experiment is extended to incorporate two additional attention mechanisms, namely Linformer {Wang2020} and Performer {Choromanski2020}, into a decision fusion framework.
