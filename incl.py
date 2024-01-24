@@ -1,4 +1,4 @@
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score, average_precision_score, accuracy_score, recall_score, f1_score, precision_score
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score, roc_auc_score, average_precision_score, accuracy_score, recall_score, f1_score, precision_score
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
@@ -270,3 +270,51 @@ class LDAMLoss(nn.Module):
     
         output = torch.where(index, x_m, x)
         return F.cross_entropy(self.s*output, target, weight=self.weight)
+
+def create_partition(dataset, num_partitions):
+    num_examples = len(dataset)
+    partition_size = num_examples // num_partitions
+    indices = list(range(num_examples))
+    indices = indices[:num_partitions * partition_size]  
+
+    
+    random_seed=42
+    random.Random(random_seed).shuffle(indices)
+    
+
+    
+    partitions = []
+    for i in range(num_partitions):
+        start_index = i * partition_size
+        end_index = (i + 1) * partition_size
+        partition_indices = indices[start_index:end_index]
+        partition = dataset.select(partition_indices)
+        partitions.append(partition)
+
+    return partitions
+
+
+def load_loaders_fed(base_dir):
+    ds = load_dataset("imagefolder", data_dir=base_dir, drop_labels=False)
+    partitions_train = create_partition(ds['train'], NUM_CLIENTS)
+    partitions_val = create_partition(ds['val'], NUM_CLIENTS)
+
+    trainloaders = []
+    valloaders = []
+    for partition_id in range(NUM_CLIENTS):
+        partition_train = partitions_train[partition_id]
+        partition_train = partition_train.with_transform(train_transform)
+        trainloaders.append(DataLoader(partition_train, batch_size=BATCH_SIZE))
+
+        partition_val = partitions_val[partition_id]
+        partition_val = partition_val.with_transform(valid_transform)
+        valloaders.append(DataLoader(partition_val, batch_size=BATCH_SIZE))
+    testset = ds['test'].with_transform(valid_transform)
+    testloader = DataLoader(testset, batch_size=BATCH_SIZE)
+    return trainloaders, valloaders, testloader
+
+def load_datasets_fed(base_dir):
+    ds = load_dataset("imagefolder", data_dir=base_dir, drop_labels=False)
+    partitions_train = create_partition(ds['train'], NUM_CLIENTS)
+    partitions_val = create_partition(ds['validation'], NUM_CLIENTS)
+    return partitions_train, partitions_val, ds['test']    

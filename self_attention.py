@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import ViTConfig
+from transformers import ViTConfig, ViTForImageClassification
 import math
 from performer_pytorch import SelfAttention as PerformerAttention
 
@@ -376,3 +376,151 @@ class WeightedSumNetwork(nn.Module):
         combined_attention_map = weights[:,:,:,0].unsqueeze(-1) * attention_map1 + weights[:,:,:,1].unsqueeze(-1) * attention_map2 + weights[:,:,:,2].unsqueeze(-1) * attention_map3
         
         return combined_attention_map
+
+class FusionAttention(nn.Module):
+    def __init__(self, config: ViTConfig, att) -> None:
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size {config.hidden_size,} is not a multiple of the number of attention "
+                f"heads {config.num_attention_heads}."
+            )
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.score = nn.Linear(self.attention_head_size, 1, bias=config.qkv_bias)
+
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+
+        self.att = att
+
+        # FOR LINFORMER
+        self.num_feats = 32 
+        self.scale = None or self.attention_head_size ** -0.5
+        self.kv = nn.Linear(config.hidden_size, config.hidden_size * 2, bias=config.qkv_bias)
+        self.proj_k = nn.Parameter(init_(torch.zeros(seq_len, self.num_feats)))
+        seq_len = 197
+        if share_kv:
+            self.proj_v = self.proj_k
+        else:
+            self.proj_v = nn.Parameter(init_(torch.zeros(seq_len, self.num_feats)))
+
+
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(
+        self, hidden_states, head_mask = None, output_attentions: bool = False
+    ):
+
+        key_layer = self.transpose_for_scores(self.key(hidden_states))
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        query_layer = self.transpose_for_scores(self.query(hidden_states))
+
+        # multiplicative attention
+        attention_scores1 = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_probs1 = nn.functional.softmax(attention_scores1, dim=-1)
+
+        # scaled attention
+        attention_scores2 = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores2 = attention_scores2 / math.sqrt(self.attention_head_size)
+        attention_probs2 = nn.functional.softmax(attention_scores2, dim=-1)
+
+        # additive
+        attention_scores3 = self.score(torch.tanh(query_layer.unsqueeze(2) + key_layer.unsqueeze(3))).squeeze(-1)
+        attention_probs3 = nn.functional.softmax(attention_scores3, dim=-1)
+
+        # linformer
+        b, n, d = hidden_states.shape
+        d_h, h, k = self.attention_head_size, self.num_attention_heads, self.num_feats
+        kv_len = n
+
+        queries = self.scale * self.query(hidden_states).reshape(b, n, h, d_h).transpose(1, 2)
+        kv = self.kv(hidden_states).reshape(b, n, 2, d).permute(2, 0, 1, 3)
+        keys, values = kv[0], kv[1]  # make torchscript happy (cannot use tensor as tuple)
+        
+        proj_seq_len = lambda args: torch.einsum('bnd,nk->bkd', *args)
+        kv_projs = (self.proj_k, self.proj_v)
+        keys, values = map(proj_seq_len, zip((keys, values), kv_projs))
+
+        merge_key_values = lambda t: t.reshape(b, k, -1, d_h).transpose(
+            1, 2).expand(-1, h, -1, -1)
+        keys, values = map(merge_key_values, (keys, values))
+
+        attn = torch.einsum('bhnd,bhkd->bhnk', queries, keys)
+        attention_probs4 = (attn - torch.max(attn, dim=-1, keepdim=True)[0]).softmax(dim=-1)
+
+        # fusion
+        if self.att == 13:
+            attention_probs = torch.mul(torch.mul(attention_probs1, attention_probs2), attention_probs3)
+        elif self.att == 14:
+            attention_probs = torch.maximum(torch.maximum(attention_probs1, attention_probs2), attention_probs3)
+        elif self.att == 17:
+            attention_probs = torch.mean(torch.stack([attention_probs1, attention_probs2, attention_probs3]), dim=0)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.dropout(attention_probs)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
+
+        context_layer = torch.matmul(attention_probs, value_layer)
+
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(new_context_layer_shape)
+
+        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+
+        return outputs
+
+def getFusionModel(model_name_or_path, labels, att, nattlayer):
+    #prepare model
+    model = ViTForImageClassification.from_pretrained( # for ViT
+    # model = DeiTForImageClassification.from_pretrained( # for DeiT
+        model_name_or_path,
+        num_labels=len(labels),
+        id2label={str(i): c for i, c in enumerate(labels)},
+        label2id={c: str(i) for i, c in enumerate(labels)},
+        ignore_mismatched_sizes=True
+    )
+    # print(model)
+    # config = ViTConfig.from_pretrained(model_name_or_path)
+    config = model.config
+    if att == 0:
+        pass
+    else:
+        if att == 1: #scaleddotproduct attention
+            for x in range(nattlayer):
+                model.vit.encoder.layer[x-nattlayer].attention.attention = ScaledDotProductAttention(config)
+                # model.deit.encoder.layer[x-nattlayer].attention.attention = ScaledDotProductAttention(config) # for DeiT
+        elif att == 2: #multiplicative attention
+            for x in range(nattlayer):
+                model.vit.encoder.layer[x-nattlayer].attention.attention = MultiplicativeAttention(config)
+                # model.deit.encoder.layer[x-nattlayer].attention.attention = MultiplicativeAttention(config) # for DeiT
+        elif att == 3: #additive attention
+            for x in range(nattlayer):
+                model.vit.encoder.layer[x-nattlayer].attention.attention = AdditiveAttention(config)
+                # model.deit.encoder.layer[x-nattlayer].attention.attention = AdditiveAttention(config) # for DeiT
+        elif att == 18: #linformer
+            for x in range(nattlayer):
+                model.vit.encoder.layer[x-nattlayer].attention.attention = LinformerSelfAttention(dim=768, seq_len = 197, num_heads=12, num_feats=32)
+                # model.deit.encoder.layer[x-nattlayer].attention.attention = LinformerSelfAttention(dim=768, seq_len = 197, num_heads=12, num_feats=32) # for DeiT
+        elif att == 19: #performer
+            for x in range(nattlayer):
+                model.vit.encoder.layer[x-nattlayer].attention.attention = PerformerWrapper()
+                # model.deit.encoder.layer[x-nattlayer].attention.attention = PerformerWrapper() # for DeiT
+        elif att >= 4: #max fusion
+            for x in range(nattlayer):
+                model.vit.encoder.layer[x-nattlayer].attention.attention = CustomAttention(config,att)
+                # model.deit.encoder.layer[x-nattlayer].attention.attention = CustomAttention(config,att) # for DeiT
+    return model
